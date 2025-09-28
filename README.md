@@ -1,3 +1,4 @@
+
 # 🚀 DWD: The Ultimate Download Manager 🚀
 
 ![DWD](https://img.shields.io/badge/DWD-v1.0-blue?style=flat-square&logo=python) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -35,7 +36,8 @@ pipx install yt-dlp requests rich
   sudo chmod +x /usr/local/bin/dwd
   ```
 
-# Help : ```bash dwd --help ```
+# Help : 
+```bash dwd --help ```
 
 # Check if /usr/local/bin is in $PATH:
   ```bash
