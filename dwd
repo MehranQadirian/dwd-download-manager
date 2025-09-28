@@ -12,10 +12,13 @@ from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, 
 from rich.panel import Panel
 from rich.text import Text
 from rich.prompt import Prompt
+from rich.table import Table
 import logging
 import re
 import datetime
 import json
+import hashlib
+import queue
 
 # تنظیم لاگ
 logging.basicConfig(filename='download.log', level=logging.INFO, 
@@ -23,8 +26,14 @@ logging.basicConfig(filename='download.log', level=logging.INFO,
 
 console = Console()
 
+# صف دانلود
+download_queue = queue.Queue()
+
+def print_welcome_message():
+    welcome_text = Text("🚀 DWD: The Ultimate Download Manager 🚀", style="bold magenta")
+    console.print(Panel(welcome_text, title="Welcome", border_style="cyan", padding=(1, 2)))
+
 def get_filename_from_url(url, is_youtube=False):
-    """استخراج نام فایل از لینک یا yt-dlp"""
     if is_youtube:
         try:
             result = subprocess.run(['yt-dlp', '--get-filename', '-f', 'best', url], capture_output=True, text=True)
@@ -37,7 +46,6 @@ def get_filename_from_url(url, is_youtube=False):
     return urllib.parse.unquote(filename) if filename else "downloaded_file"
 
 def get_file_size(url, is_youtube=False):
-    """دریافت اندازه فایل از سرور یا yt-dlp"""
     if is_youtube:
         return None, 'video/mp4'
     try:
@@ -46,11 +54,10 @@ def get_file_size(url, is_youtube=False):
         content_type = response.headers.get('content-type', 'unknown')
         return size if size > 0 else None, content_type
     except Exception as e:
-        console.print(f"[red]Warning: Could not get file size: {e}[/red]")
+        console.print(Panel(f"⚠️ Warning: Could not get file size: {e}", style="yellow"))
         return None, 'unknown'
 
 def get_youtube_info(url):
-    """دریافت اطلاعات ویدیوی یوتیوب"""
     try:
         result = subprocess.run(['yt-dlp', '--dump-json', url], capture_output=True, text=True)
         info = json.loads(result.stdout)
@@ -60,7 +67,7 @@ def get_youtube_info(url):
             'formats': [(f.get('format_id'), f.get('ext'), f.get('resolution', 'Unknown')) for f in info.get('formats', [])]
         }
     except Exception as e:
-        console.print(f"[red]Error getting YouTube info: {e}[/red]")
+        console.print(Panel(f"❌ Error getting YouTube info: {e}", style="red"))
         return None
 
 def is_youtube_url(url):
@@ -69,163 +76,331 @@ def is_youtube_url(url):
     return bool(re.search(youtube_regex, url))
 
 def play_completion_sound():
-    """پخش صدا هنگام اتمام دانلود"""
     try:
         subprocess.run(['mpg123', '/usr/share/sounds/freedesktop/stereo/complete.oga'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        console.print("🎵 Played completion sound!", style="green")
     except:
-        console.print("[yellow]Warning: Could not play completion sound. Install mpg123 or check sound file.[/yellow]")
+        console.print(Panel("⚠️ Warning: Could not play sound. Install mpg123.", style="yellow"))
 
 def send_notification(filename, output_path):
-    """ارسال نوتیفیکیشن دسکتاپ"""
     try:
-        subprocess.run(['notify-send', 'DWD: Download Completed', f'{filename} saved to {output_path}'], check=True)
+        subprocess.run(['notify-send', '🎉 DWD: Download Completed', f'{filename} saved to {output_path}'], check=True)
+        console.print("📬 Notification sent!", style="green")
     except:
-        console.print("[yellow]Warning: Could not send notification. Install libnotify-bin.[/yellow]")
+        console.print(Panel("⚠️ Warning: Could not send notification. Install libnotify-bin.", style="yellow"))
 
-def download_file(url, output_dir, proxy=None, youtube=False, play_sound=False, quality='best'):
-    """دانلود فایل با wget یا yt-dlp و نمایش Progress Bar"""
+def verify_file_integrity(file_path, expected_hash=None, hash_type='sha256'):
+    if not expected_hash:
+        console.print(Panel("⚠️ No expected hash provided. Skipping integrity check.", style="yellow"))
+        return True
+    try:
+        hash_func = hashlib.sha256() if hash_type == 'sha256' else hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b''):
+                hash_func.update(chunk)
+        calculated_hash = hash_func.hexdigest()
+        if calculated_hash == expected_hash:
+            console.print(Panel("✅ File integrity verified!", style="green"))
+            return True
+        else:
+            console.print(Panel(f"❌ File integrity check failed!\nCalculated: {calculated_hash}\nExpected: {expected_hash}", style="red"))
+            return False
+    except Exception as e:
+        console.print(Panel(f"❌ Error verifying integrity: {e}", style="red"))
+        return False
+
+def display_file_info(url, is_youtube, total_size, content_type, youtube_info=None):
+    table = Table(title="📋 File Information", style="cyan", title_style="bold magenta")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value", style="green")
+    
+    table.add_row("🌐 URL", url)
+    table.add_row("📛 Filename", get_filename_from_url(url, is_youtube))
+    table.add_row("📏 Size", f"{total_size:,} bytes" if total_size else "Unknown")
+    table.add_row("📂 Type", content_type)
+    
+    if is_youtube and youtube_info:
+        table.add_row("🎥 Title", youtube_info['title'])
+        table.add_row("⏳ Duration", str(datetime.timedelta(seconds=youtube_info['duration'])))
+        formats = "\n".join([f"{fmt_id}: {res} ({ext})" for fmt_id, ext, res in youtube_info['formats']])
+        table.add_row("🎞️ Formats", formats)
+    
+    console.print(table)
+
+def download_part(url, start, end, temp_path, part_num, progress, task):
+    headers = {'Range': f'bytes={start}-{end}'}
+    try:
+        response = requests.get(url, headers=headers, stream=True, timeout=10)
+        with open(f'{temp_path}.part{part_num}', 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    progress.update(task, advance=len(chunk))
+    except Exception as e:
+        console.print(Panel(f"❌ Error downloading part {part_num}: {e}", style="red"))
+        raise
+
+def multi_part_download(url, output_path, num_parts=4, total_size=None, progress=None, task=None):
+    if not total_size:
+        console.print(Panel("⚠️ Cannot use multi-part without known file size.", style="yellow"))
+        return False
+    
+    part_size = total_size // num_parts
+    temp_path = output_path + '.temp'
+    with ThreadPoolExecutor(max_workers=num_parts) as executor:
+        futures = []
+        for i in range(num_parts):
+            start = i * part_size
+            end = start + part_size - 1 if i < num_parts - 1 else total_size - 1
+            futures.append(executor.submit(download_part, url, start, end, temp_path, i, progress, task))
+        
+        for future in futures:
+            try:
+                future.result()
+            except:
+                return False
+    
+    with open(output_path, 'wb') as f:
+        for i in range(num_parts):
+            part_file = f'{temp_path}.part{i}'
+            if os.path.exists(part_file):
+                with open(part_file, 'rb') as part:
+                    f.write(part.read())
+                os.remove(part_file)
+    
+    return True
+
+def download_file(url, output_dir, proxy=None, youtube=False, play_sound=False, quality='best', rate_limit=None, retries=3, multi_part=False, hash_check=None, hash_type='sha256'):
     is_youtube = youtube or is_youtube_url(url)
     filename = get_filename_from_url(url, is_youtube)
     output_path = os.path.join(os.path.expanduser(output_dir), filename)
     
-    console.print(Panel(f"[bold cyan]Starting download: {url}[/bold cyan]", title="Download Info"))
-    
-    # نمایش اطلاعات ویدیوی یوتیوب
-    if is_youtube:
-        info = get_youtube_info(url)
-        if info:
-            console.print(f"[green]Title: {info['title']}[/green]")
-            console.print(f"[green]Duration: {datetime.timedelta(seconds=info['duration'])}[/green]")
-            console.print("[green]Available formats:[/green]")
-            for fmt_id, ext, res in info['formats']:
-                console.print(f"  [cyan]{fmt_id}: {res} ({ext})[/cyan]")
-            if quality == 'best':
-                console.print("[yellow]Using best quality. Use --quality to specify format.[/yellow]")
-            else:
-                console.print(f"[yellow]Selected quality: {quality}[/yellow]")
-    
     total_size, content_type = get_file_size(url, is_youtube)
-    if total_size:
-        console.print(f"[green]File size: {total_size:,} bytes | Type: {content_type}[/green]")
-    else:
-        console.print("[yellow]Warning: File size unknown, progress bar may be inaccurate.[/yellow]")
+    youtube_info = get_youtube_info(url) if is_youtube else None
+    display_file_info(url, is_youtube, total_size, content_type, youtube_info)
     
-    # تنظیم دستور دانلود
-    if is_youtube:
-        cmd = ['yt-dlp', url, '-o', output_path, '-f', quality]
-        if proxy:
-            cmd.extend(['--proxy', proxy])
-    else:
-        cmd = ['wget', url, '-O', output_path, '--show-progress', '-c']
-        if proxy:
-            cmd.extend(['--proxy', proxy])
-    
-    # زمان شروع برای محاسبه سرعت متوسط
-    start_time = time.time()
-    
-    # اجرای دستور
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    
-    # Progress Bar با rich
-    with Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=50),
-        "[progress.percentage]{task.percentage:>3.1f}%",
-        "•",
-        TransferSpeedColumn(),
-        "•",
-        TimeRemainingColumn(),
-        console=console
-    ) as progress:
-        task = progress.add_task(f"[cyan]{filename}", total=total_size)
-        
-        while not os.path.exists(output_path):
-            time.sleep(0.5)
-            if process.poll() is not None:
-                stdout, stderr = process.communicate()
-                console.print(f"[red]Error: {stderr}[/red]")
-                console.print("[red]Possible reasons: Network issue, invalid URL, or yt-dlp needs update. Try with --proxy.[/red]")
-                logging.error(f"Failed to download {url}: {stderr}")
-                return False
-        
-        while process.poll() is None:
-            if os.path.exists(output_path):
-                current_size = os.path.getsize(output_path)
-                if total_size:
-                    progress.update(task, completed=current_size)
-                else:
-                    progress.update(task, description=f"[cyan]{filename} ({current_size:,} bytes)")
-            time.sleep(0.5)
-        
-        # به‌روزرسانی نهایی Progress Bar
-        if os.path.exists(output_path):
-            final_size = os.path.getsize(output_path)
-            if total_size:
-                progress.update(task, completed=final_size, total=final_size)
+    for attempt in range(retries):
+        try:
+            start_time = time.time()
+            
+            if is_youtube:
+                cmd = ['yt-dlp', url, '-o', output_path, '-f', quality]
+                if proxy:
+                    cmd.extend(['--proxy', proxy])
+                if rate_limit:
+                    cmd.extend(['--limit-rate', rate_limit])
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             else:
-                progress.update(task, description=f"[cyan]{filename} ({final_size:,} bytes)")
+                if multi_part and total_size and not is_youtube:
+                    with Progress(
+                        TextColumn("📥 {task.description}"),
+                        BarColumn(bar_width=50, style="green"),
+                        "[progress.percentage]{task.percentage:>3.1f}%",
+                        "•",
+                        TransferSpeedColumn(),
+                        "•",
+                        TimeRemainingColumn(),
+                        console=console
+                    ) as progress:
+                        task = progress.add_task(f"[cyan]{filename} (Multi-part)", total=total_size)
+                        success = multi_part_download(url, output_path, num_parts=4, total_size=total_size, progress=progress, task=task)
+                        if not success:
+                            raise Exception("Multi-part download failed")
+                else:
+                    cmd = ['wget', url, '-O', output_path, '--show-progress', '-c']
+                    if proxy:
+                        cmd.extend(['--proxy', proxy])
+                    if rate_limit:
+                        cmd.extend(['--limit-rate', rate_limit])
+                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                
+                with Progress(
+                    TextColumn("📥 {task.description}"),
+                    BarColumn(bar_width=50, style="green"),
+                    "[progress.percentage]{task.percentage:>3.1f}%",
+                    "•",
+                    TransferSpeedColumn(),
+                    "•",
+                    TimeRemainingColumn(),
+                    console=console
+                ) as progress:
+                    task = progress.add_task(f"[cyan]{filename}", total=total_size)
+                    
+                    while not os.path.exists(output_path):
+                        time.sleep(0.5)
+                        if process.poll() is not None:
+                            raise Exception("Process terminated early")
+                    
+                    while process.poll() is None:
+                        if os.path.exists(output_path):
+                            current_size = os.path.getsize(output_path)
+                            if total_size:
+                                progress.update(task, completed=current_size)
+                            else:
+                                progress.update(task, description=f"[cyan]{filename} ({current_size:,} bytes)")
+                        time.sleep(0.5)
+                    
+                    if os.path.exists(output_path):
+                        final_size = os.path.getsize(output_path)
+                        if total_size:
+                            progress.update(task, completed=final_size, total=final_size)
+                        else:
+                            progress.update(task, description=f"[cyan]{filename} ({final_size:,} bytes)")
+                    
+                    stdout, stderr = process.communicate()
+                    if process.returncode != 0:
+                        raise Exception(f"Download error: {stderr}")
+            
+            elapsed_time = time.time() - start_time
+            final_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+            avg_speed = final_size / elapsed_time / 1024 if elapsed_time > 0 else 0  # KB/s
+            
+            if hash_check and not verify_file_integrity(output_path, hash_check, hash_type):
+                os.remove(output_path)
+                raise Exception("Integrity check failed")
+            
+            success_text = Text(
+                f"🎉 Download completed: {filename}\n"
+                f"📏 Size: {final_size:,} bytes\n"
+                f"📂 Path: {output_path}\n"
+                f"⚡ Average Speed: {avg_speed:.2f} KB/s\n"
+                f"⏱️ Time Taken: {datetime.timedelta(seconds=int(elapsed_time))}",
+                style="bold green"
+            )
+            console.print(Panel(success_text, title="✅ Success", border_style="green", padding=(1, 2)))
+            logging.info(f"Downloaded {url} to {output_path} ({final_size:,} bytes, avg speed: {avg_speed:.2f} KB/s)")
+            
+            if play_sound:
+                play_completion_sound()
+            send_notification(filename, output_path)
+            
+            return True
         
-        stdout, stderr = process.communicate()
-        if process.returncode != 0:
-            console.print(f"[red]Error: {stderr}[/red]")
-            console.print("[red]Possible reasons: Network issue, invalid URL, or yt-dlp needs update. Try with --proxy.[/red]")
-            logging.error(f"Failed to download {url}: {stderr}")
-            return False
+        except Exception as e:
+            console.print(Panel(f"⚠️ Attempt {attempt + 1}/{retries} failed: {e}. Retrying...", style="yellow"))
+            time.sleep(2 ** attempt)  # Exponential backoff
     
-    # محاسبه سرعت متوسط
-    elapsed_time = time.time() - start_time
-    final_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-    avg_speed = final_size / elapsed_time / 1024 if elapsed_time > 0 else 0  # KB/s
-    
-    # نمایش پیام نهایی
-    console.print(Panel(
-        Text(f"Download completed: {filename}\n"
-             f"Size: {final_size:,} bytes\n"
-             f"Path: {output_path}\n"
-             f"Average Speed: {avg_speed:.2f} KB/s\n"
-             f"Time Taken: {datetime.timedelta(seconds=int(elapsed_time))}",
-             style="bold green"),
-        title="Success"
-    ))
-    logging.info(f"Downloaded {url} to {output_path} ({final_size:,} bytes, avg speed: {avg_speed:.2f} KB/s)")
-    
-    # پخش صدا و نوتیفیکیشن
-    if play_sound:
-        play_completion_sound()
-    send_notification(filename, output_path)
-    
-    return True
+    console.print(Panel(f"❌ Failed to download {url} after {retries} attempts.", style="red"))
+    logging.error(f"Failed to download {url} after {retries} attempts")
+    return False
+
+def add_to_queue(urls):
+    for url in urls:
+        download_queue.put(url)
+    console.print(Panel(f"✅ Added {len(urls)} URLs to download queue.", style="green"))
+
+def process_queue(output_dir, proxy, youtube, sound, quality, rate_limit, retries, multi_part, hash_check, hash_type):
+    console.print(Panel(f"📋 Processing download queue ({download_queue.qsize()} items)", style="cyan"))
+    while not download_queue.empty():
+        url = download_queue.get()
+        download_file(url, output_dir, proxy, youtube, sound, quality, rate_limit, retries, multi_part, hash_check, hash_type)
+    console.print(Panel("🎉 All queued downloads completed!", style="green"))
+
+def read_urls_from_file(file_path):
+    try:
+        with open(file_path, 'r') as f:
+            urls = [line.strip() for line in f if line.strip()]
+        console.print(Panel(f"✅ Loaded {len(urls)} URLs from {file_path}", style="green"))
+        return urls
+    except Exception as e:
+        console.print(Panel(f"❌ Error reading input file: {e}", style="red"))
+        return []
+
+def interactive_menu():
+    while True:
+        console.print(Panel("📋 DWD Menu", title="Menu", style="cyan"))
+        console.print("1️⃣ Download a single URL")
+        console.print("2️⃣ Download from file")
+        console.print("3️⃣ Add URLs to queue")
+        console.print("4️⃣ Process download queue")
+        console.print("5️⃣ Exit")
+        
+        choice = Prompt.ask("Enter your choice", choices=["1", "2", "3", "4", "5"], default="1")
+        
+        if choice == "1":
+            url = Prompt.ask("🌐 Enter URL")
+            output_dir = Prompt.ask("📂 Output directory", default="~/Downloads")
+            quality = Prompt.ask("🎥 YouTube quality (if applicable)", default="best")
+            play_sound = Prompt.ask("🎵 Play sound on completion? (y/n)", default="n") == "y"
+            multi_part = Prompt.ask("📦 Use multi-part download? (y/n)", default="n") == "y"
+            download_file(url, output_dir, quality=quality, play_sound=play_sound, multi_part=multi_part)
+        
+        elif choice == "2":
+            file_path = Prompt.ask("📄 Path to URL file")
+            output_dir = Prompt.ask("📂 Output directory", default="~/Downloads")
+            quality = Prompt.ask("🎥 YouTube quality (if applicable)", default="best")
+            play_sound = Prompt.ask("🎵 Play sound on completion? (y/n)", default="n") == "y"
+            multi_part = Prompt.ask("📦 Use multi-part download? (y/n)", default="n") == "y"
+            urls = read_urls_from_file(file_path)
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [executor.submit(download_file, url, output_dir, quality=quality, play_sound=play_sound, multi_part=multi_part) for url in urls]
+                for future in futures:
+                    future.result()
+        
+        elif choice == "3":
+            urls = Prompt.ask("🌐 Enter URLs (comma-separated)").split(',')
+            add_to_queue([url.strip() for url in urls])
+        
+        elif choice == "4":
+            output_dir = Prompt.ask("📂 Output directory", default="~/Downloads")
+            quality = Prompt.ask("🎥 YouTube quality (if applicable)", default="best")
+            play_sound = Prompt.ask("🎵 Play sound on completion? (y/n)", default="n") == "y"
+            multi_part = Prompt.ask("📦 Use multi-part download? (y/n)", default="n") == "y"
+            process_queue(output_dir, None, False, play_sound, quality, None, 3, multi_part, None, 'sha256')
+        
+        elif choice == "5":
+            console.print(Panel("👋 Goodbye!", style="cyan"))
+            sys.exit(0)
 
 def main():
     parser = argparse.ArgumentParser(description="🚀 DWD: The Ultimate Download Manager 🚀")
-    parser.add_argument('urls', nargs='+', help="One or more URLs to download")
+    parser.add_argument('--interactive', '-i', action='store_true', help="Run in interactive mode")
+    parser.add_argument('urls', nargs='*', help="One or more URLs to download")
     parser.add_argument('--output-dir', '-o', default='~/Downloads', help="Directory to save downloaded files")
-    parser.add_argument('--proxy', '-p', help="Proxy server (e.g., http://proxy:port or socks5://proxy:port)")
+    parser.add_argument('--proxy', '-p', help="Proxy server (e.g., http://proxy:port)")
     parser.add_argument('--threads', '-t', type=int, default=3, help="Number of parallel downloads")
     parser.add_argument('--youtube', '-y', action='store_true', help="Force YouTube download mode with yt-dlp")
     parser.add_argument('--sound', '-s', action='store_true', help="Play a sound when download completes")
-    parser.add_argument('--quality', '-q', default='best', help="YouTube video quality (e.g., best, 720p, 1080p, or format ID)")
+    parser.add_argument('--quality', '-q', default='best', help="YouTube video quality (e.g., best, 720p, 1080p)")
+    parser.add_argument('--rate-limit', '-r', help="Limit download speed (e.g., 500k, 1m)")
+    parser.add_argument('--retries', type=int, default=3, help="Number of retry attempts")
+    parser.add_argument('--multi-part', '-m', action='store_true', help="Use multi-part download for large files")
+    parser.add_argument('--hash-check', help="Expected hash for integrity check")
+    parser.add_argument('--hash-type', default='sha256', choices=['sha256', 'md5'], help="Hash type for integrity check")
+    parser.add_argument('--input-file', help="Text file containing URLs to download")
+    parser.add_argument('--queue', action='store_true', help="Add URLs to queue instead of immediate download")
     
     args = parser.parse_args()
     
-    console.print(Panel("[bold magenta]Welcome to DWD: The Ultimate Download Manager![/bold magenta]", title="DWD"))
+    print_welcome_message()
     
-    # دانلود فایل‌ها به صورت موازی
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        futures = [executor.submit(download_file, url, args.output_dir, args.proxy, args.youtube, args.sound, args.quality) for url in args.urls]
-        for future in futures:
-            future.result()
+    if args.interactive:
+        interactive_menu()
+        return
     
-    console.print("[bold green]All downloads completed![/bold green]")
+    urls = args.urls
+    if args.input_file:
+        urls.extend(read_urls_from_file(args.input_file))
+    
+    if args.queue:
+        add_to_queue(urls)
+        process_queue(args.output_dir, args.proxy, args.youtube, args.sound, args.quality, args.rate_limit, args.retries, args.multi_part, args.hash_check, args.hash_type)
+    else:
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            futures = [executor.submit(download_file, url, args.output_dir, args.proxy, args.youtube, args.sound, args.quality, args.rate_limit, args.retries, args.multi_part, args.hash_check, args.hash_type) for url in urls]
+            for future in futures:
+                future.result()
+    
+    console.print(Panel("🎉 All downloads completed!", style="green"))
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        console.print("[yellow]Download interrupted by user.[/yellow]")
+        console.print(Panel("⚠️ Download interrupted by user.", style="yellow"))
         logging.warning("Download interrupted by user")
         sys.exit(1)
     except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
+        console.print(Panel(f"❌ Unexpected error: {e}", style="red"))
         logging.error(f"Unexpected error: {e}")
         sys.exit(1)
