@@ -37,7 +37,9 @@ pipx install yt-dlp requests rich
   ```
 
 # Help : 
-```bash dwd --help ```
+```bash
+dwd --help
+```
 
 # Check if /usr/local/bin is in $PATH:
   ```bash
